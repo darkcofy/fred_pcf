@@ -1,0 +1,153 @@
+---
+version: '2'
+services:
+  redpanda:
+    image: vectorized/redpanda:v22.3.11
+    container_name: redpanda
+    ports:
+      - "9092:9092"
+      - "8082:8082"
+      - "29092:29092"
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - "1G"
+      - --reserve-memory
+      - "0M"
+      - --node-id
+      - "0"
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - PLAINTEXT://redpanda:29092,OUTSIDE://redpanda:9092
+      - --check=false
+
+  console:
+    image: vectorized/console:v2.1.1
+    entrypoint: /bin/sh
+    command: -c "echo \"$$CONSOLE_CONFIG_FILE\" > /tmp/config.yml; /app/console"
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:29092"]
+        connect:
+          enabled: true
+          clusters:
+            - name: local-connect-cluster
+              url: http://connect:8083
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda:9644"]
+    ports:
+      - 8080:8080
+    depends_on:
+      - redpanda
+      - connect
+
+  minio:
+    image: minio/minio:RELEASE.2022-12-07T00-56-37Z
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server --console-address ":9001" /data
+
+  aws:
+    image: amazon/aws-cli
+    container_name: aws-cli
+    command: -c "sleep 2 && aws --endpoint-url http://minio:9000 s3 mb s3://fred-pcf --region eu-west-1 || exit 0"
+    entrypoint: [/bin/bash]
+    environment: 
+      AWS_ACCESS_KEY_ID: "minioadmin"
+      AWS_SECRET_ACCESS_KEY: "minioadmin"
+    depends_on: 
+      - minio
+
+  connect:
+    image: confluentinc/cp-kafka-connect-base:7.3.0
+    depends_on:
+        - redpanda
+    hostname: connect
+    container_name: connect
+    ports:
+      - 8083:8083
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: 'redpanda:9092'
+      CONNECT_REST_ADVERTISED_HOST_NAME: "connect"
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: connect-cluster-group
+      CONNECT_CONFIG_STORAGE_TOPIC: _kafka-connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _kafka-connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _kafka-connect-status
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_INTERNAL_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_INTERNAL_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_LOG4J_ROOT_LOGLEVEL: "INFO"
+      CONNECT_LOG4J_LOGGERS: "org.apache.kafka.connect.runtime.rest=WARN,org.reflections=ERROR"
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_PLUGIN_PATH: '/usr/share/java,/usr/share/confluent-hub-components/,/connectors/'
+
+      AWS_ACCESS_KEY_ID: "minioadmin"
+      AWS_SECRET_ACCESS_KEY: "minioadmin"
+    command: 
+      - bash 
+      - -c 
+      - |
+        #
+        echo "Installing connector plugins"
+        confluent-hub install --no-prompt confluentinc/kafka-connect-s3:10.3.0
+        #
+        echo "Launching Kafka Connect worker"
+        /etc/confluent/docker/run & 
+        #
+        echo "Waiting for Kafka Connect to start listening on localhost ⏳"
+        while : ; do
+          curl_status=$$(curl -s -o /dev/null -w %{http_code} http://localhost:8083/connectors)
+          echo -e $$(date) " Kafka Connect listener HTTP state: " $$curl_status " (waiting for 200)"
+          if [ $$curl_status -eq 200 ] ; then
+            break
+          fi
+          sleep 5 
+        done
+        echo -e "\n--\n+> Creating connector"
+        curl -X PUT \
+        -H 'Content-Type: application/json' \
+        -H 'Accept: application/json' http://localhost:8083/connectors/S3SinkConnector/config \
+        -d '{
+        "connector.class": "io.confluent.connect.s3.S3SinkConnector",
+        "storage.class": "io.confluent.connect.s3.storage.S3Storage",
+        "s3.region": "eu-west-1",
+        "s3.bucket.name": "fred-pcf",
+      
+        "s3.part.retries":"3",
+        "s3.retry.backoff.ms":"400",
+        "behavior.on.null.values":"fail",
+        
+        "topics.dir": "pcf-datalake",
+        "flush.size": "1",
+        "schema.compatibility": "NONE",
+        "tasks.max": "1",
+        "topics": "game-analytics",
+        "store.url": "http://minio:9000",
+        "key.converter.schemas.enable": "false",
+        "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+        "format.class": "io.confluent.connect.s3.format.json.JsonFormat",
+        "partitioner.class": "io.confluent.connect.storage.partitioner.TimeBasedPartitioner",
+        "path.format" : "'\'year\''=YYYY/'\'month\''=MM/'\'day\''=dd/'\'hour\''=HH",
+        "timestamp.extractor" : "Record",
+        "partition.duration.ms": "60000",
+        "locale": "en-US",
+        "timezone": "UTC" ,
+        "value.converter.schemas.enable": "false",
+        "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "schemas.enable": "false"
+        }'
+        sleep infinity
